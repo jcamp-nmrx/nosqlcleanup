@@ -2,8 +2,8 @@
 
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from dateutil.relativedelta import relativedelta
 from borneo import NoSQLHandle, NoSQLHandleConfig, QueryRequest
 from borneo.iam import SignatureProvider
 import oci
@@ -42,8 +42,8 @@ def read_last_run(oci_client):
         return ts
     except oci.exceptions.ServiceError as e:
         if e.status == 404:
-            # First ever run — go back 1 hour
-            ts = datetime.now(timezone.utc) - relativedelta(hours=1)
+            # First ever run — start from the beginning of the table
+            ts = datetime(2025, 8, 1, 14, 22, 34, tzinfo=timezone.utc)
             print(f"No state file found. Defaulting to: {ts.isoformat()}")
             return ts
         raise
@@ -88,6 +88,16 @@ def serialize_row(row):
             out[k] = v
     return out
 
+# ── Write one group to object store ──────────────────────────────────────────
+def write_group(key, rows, run_ts, oci_client):
+    year, month, day, hour, te_id = key
+    sample_time = datetime(year, month, day, hour, tzinfo=timezone.utc)
+    obj_path    = build_object_path(sample_time, te_id, run_ts)
+    payload     = json.dumps(rows, indent=2).encode('utf-8')
+    oci_client.put_object(OCI_NAMESPACE, BUCKET, obj_path, payload,
+                          content_type='application/json')
+    return obj_path
+
 # ── Core extract logic ────────────────────────────────────────────────────────
 def extract_and_write(since_ts, run_ts, nosql_handle, oci_client):
     """
@@ -123,39 +133,23 @@ def extract_and_write(since_ts, run_ts, nosql_handle, oci_client):
 
     print(f"Fetched rows grouped into {len(groups):,} buckets")
 
-    # ── Write each group to object store ─────────────────────────────────────
+    # ── Write each group to object store via thread pool ─────────────────────
     written = 0
     errors  = 0
-    lock    = threading.Lock()
 
-    def write_group(key, rows):
-        nonlocal written, errors
-        year, month, day, hour, te_id = key
-        sample_time = datetime(year, month, day, hour, tzinfo=timezone.utc)
-        obj_path    = build_object_path(sample_time, te_id, run_ts)
-        payload     = json.dumps(rows, indent=2).encode('utf-8')
-        try:
-            oci_client.put_object(OCI_NAMESPACE, BUCKET, obj_path, payload,
-                                  content_type='application/json')
-            with lock:
+    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        futures = {
+            executor.submit(write_group, key, rows, run_ts, oci_client): key
+            for key, rows in groups.items()
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                obj_path = future.result()
                 written += 1
-        except Exception as e:
-            print(f"  ERROR writing {obj_path}: {e}")
-            with lock:
+            except Exception as e:
+                print(f"  ERROR writing {key}: {e}")
                 errors += 1
-
-    threads = []
-    for key, rows in groups.items():
-        t = threading.Thread(target=write_group, args=(key, rows))
-        threads.append(t)
-        t.start()
-        # cap concurrency
-        if len([x for x in threads if x.is_alive()]) >= WORKERS:
-            for x in threads:
-                x.join(timeout=0.1)
-
-    for t in threads:
-        t.join()
 
     print(f"Done -- written={written:,}  errors={errors}")
     return errors == 0
@@ -174,6 +168,8 @@ def main():
         write_last_run(oci_client, run_ts)
     else:
         print("Errors occurred -- last_run.json NOT updated. Will retry from same timestamp next run.")
+
+    nosql_handle.close()
 
 if __name__ == '__main__':
     main()
