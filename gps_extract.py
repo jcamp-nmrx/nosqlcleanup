@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import json
-import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from borneo import NoSQLHandle, NoSQLHandleConfig, QueryRequest
@@ -18,6 +18,10 @@ BUCKET            = 'ShieldingData'
 STATE_OBJECT      = '_state/last_run.json'
 
 WORKERS           = 4
+
+# Throttle control: rows per page and delay between pages (seconds)
+PAGE_SIZE         = 50
+PAGE_DELAY_SEC    = 0.5
 
 # ── OCI Object Store client ───────────────────────────────────────────────────
 def make_oci_client():
@@ -108,13 +112,21 @@ def extract_and_write(since_ts, run_ts, nosql_handle, oci_client):
     sql = f"SELECT * FROM {TABLE} WHERE create_date >= '{since_str}'"
     print(f"Query: {sql}")
 
-    req    = QueryRequest().set_statement(sql)
-    groups = {}   # key: (year, month, day, hour, te_id) -> list of rows
+    req    = (QueryRequest()
+              .set_statement(sql)
+              .set_limit(PAGE_SIZE))
+    groups    = {}   # key: (year, month, day, hour, te_id) -> list of rows
+    total_rows = 0
+    page_num   = 0
 
     # ── Fetch all pages ───────────────────────────────────────────────────────
     while True:
-        result = nosql_handle.query(req)
-        for row in result.get_results():
+        result    = nosql_handle.query(req)
+        page_rows = result.get_results()
+        page_num  += 1
+        total_rows += len(page_rows)
+
+        for row in page_rows:
             sample_time = row.get('sample_time')
             te_id       = row.get('te_id')
 
@@ -128,10 +140,15 @@ def extract_and_write(since_ts, run_ts, nosql_handle, oci_client):
                    sample_time.hour, te_id)
             groups.setdefault(key, []).append(serialize_row(row))
 
+        if page_num % 10 == 0:
+            print(f"  ... page {page_num}, {total_rows:,} rows fetched so far")
+
         if req.is_done():
             break
 
-    print(f"Fetched rows grouped into {len(groups):,} buckets")
+        time.sleep(PAGE_DELAY_SEC)
+
+    print(f"Fetch complete: {total_rows:,} rows grouped into {len(groups):,} buckets")
 
     # ── Write each group to object store via thread pool ─────────────────────
     written = 0
